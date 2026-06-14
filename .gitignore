@@ -1,0 +1,11 @@
+# 原始流量與個人資料輸出
+*.pcap
+*.pcapng
+frames.txt
+nte_player_info.txt
+nte_decoded_v3.json
+nte_quests_v3.csv
+categorized_records.csv
+categorized_records.json
+dense_snapshots.json
+dense_diff_*.csv
