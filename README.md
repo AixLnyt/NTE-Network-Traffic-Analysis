@@ -2,7 +2,9 @@
 
 [English](./README_EN.md) | 中文
 
-逆向工程 **異環 (Neverness to Everness)** 的私有遊戲通訊協定。透過 PCAP 流量捕獲與 Python 靜態分析，還原協定結構、序列化格式、玩家狀態資料與任務系統。
+逆向工程 **異環 (Neverness to Everness)** 的部分通訊協定。透過 PCAP 流量捕獲與 Python 靜態分析，還原一條 TCP 連線的封包格式、序列化結構、玩家基本資訊與任務系統。
+
+**本專案範圍有限**：目前所有成果僅針對 `34.110.242.50:30031` 這條 **TCP** 連線，且根據外部資訊（見下方「重要修正」），這條連線很可能只是登入/連線初始化伺服器，並非承載即時戰鬥數值（HP、能量等）的主要遊戲伺服器。
 
 ---
 
@@ -17,6 +19,23 @@
 
 ---
 
+## ⚠️ 重要修正（請先讀這段）
+
+在分析過程中，社群內有人指出：
+
+> 「`34.110.242.50:30031` 是用 TCP 的登入伺服器，真正含有玩家數值的遊戲伺服器是透過 **UE5 內建的 replication 協定**，跑在 **UDP** 之上。」
+
+這個說法在技術上是合理的——Unreal Engine 5 的網路同步（Replication）系統預設確實建立在 UDP 之上，且設計初衷就是為了即時、低延遲的玩家狀態同步，這與本專案分析的 TCP 連線（封包頻率低、像是心跳與初始化資料）的特徵相符。
+
+**這意味著什麼：**
+
+1. 我們在本專案中分析的所有內容（Frame 1-4、Dense/Sparse Zone、Quest Record 格式），**很可能都只是登入流程的一部分**，不是遊戲主世界的即時同步資料。
+2. 這也解釋了為什麼我們始終找不到 HP / 能量 / 技能 CD 等數值欄位——這些資料根本不在這條連線裡。
+3. 我們沒有自行驗證這個說法的真實性（沒有自己抓 UDP 流量比對），這是**轉述自外部來源的線索**，但目前看來相當可信。
+
+**本專案目前不會繼續往「解碼 UDP replication 流量」的方向前進**，原因是：要重建出能正確標註欄位名稱（如角色等級、HP 上限、技能冷卻）的解碼器，必須取得遊戲客戶端的完整 Class/Property 反射定義，這需要對遊戲執行檔本身進行逆向工程，已超出本專案「分析自己連線的封包格式」的範疇。
+
+---
 
 ## 目錄結構
 
@@ -50,7 +69,7 @@ python nte_decoder_v3.py test01.pcap 34.110.242.50
 # 只看任務/物品記錄
 python record_extractor.py test01.pcap 34.110.242.50
 
-# Dense Zone 差異比對（找 HP/能量/CD）
+# Dense Zone 差異比對
 python dense_zone_differ.py --add full_hp.pcap --tag full_hp
 python dense_zone_differ.py --add low_hp.pcap  --tag low_hp
 python dense_zone_differ.py --diff full_hp low_hp --csv hp_diff.csv
@@ -62,14 +81,16 @@ python frame_decoder.py --file frames.txt
 
 ---
 
-## 協定逆向分析結果
+## 已驗證的發現
+
+以下內容均經過我們自己反覆抓包、交叉比對多份 PCAP 驗證，可信度較高。
 
 ### 傳輸層
 
 | 項目 | 值 |
 |---|---|
 | 傳輸協定 | TCP |
-| 目標伺服器 | `34.110.242.50:30031`（GCP 亞洲節點） |
+| 目標伺服器 | `34.110.242.50:30031`（GCP 亞洲節點，**疑似僅為登入/初始化伺服器，見上方修正**） |
 | TLS | 有（OS 層解密，payload 本身無應用層加密） |
 | Relay server | `34.146.x.x:302xx`（房間/地圖實例，per-session） |
 
@@ -83,8 +104,6 @@ python frame_decoder.py --file frames.txt
 ```
 
 連線建立後的世界狀態幀（Frame 4）**沒有** length prefix，直接在 LE4 framing 中斷點後開始。
-
----
 
 ### Frame 結構（每次連線固定順序）
 
@@ -112,19 +131,19 @@ python frame_decoder.py --file frames.txt
 | field[4] | `34.x.x.x:302xx` | Relay server（per-session）|
 | field[5] | 座標字串 | `X,Y,Z\|Pitch,Yaw,Roll\|ScaleX,Y,Z` |
 | field[6] | `160–168` | 不明 scalar |
-| **field[7]** | `123456789012  (12位數，範例值)` | **✅ 玩家遊戲 UID**（uint64 LE，已透過遊戲內截圖驗證）|
+| **field[7]** | `123456789012  (12位數，範例值)` | **玩家遊戲 UID**（uint64 LE，已透過遊戲內截圖驗證）|
 | field[8] | blueprint path | 角色藍圖路徑（含角色名）|
 | field[11] | `1` | active flag |
 | field[12] | `75777 / 77825` | Zone / Map Instance ID（隨地圖變化）|
 | field[13] | `0xCDCDCDCD` | 未初始化欄位（MSVC debug heap fill pattern，伺服器未設定）|
 
-> **重要修正**：field[7] 之前誤判為 uint32 nonce（`0xCE5A6BFA` = 3462032378），實際應讀取為 **uint64 LE**（後 4 bytes `32 00 00 00`），完整值為 `123456789012  (12位數，範例值)`，即玩家的遊戲內 UID。
+> **欄位修正紀錄**：field[7] 一度被誤判為 uint32 nonce（`0xCE5A6BFA` = 3462032378），實際應讀取為 **uint64 LE**（後 4 bytes `32 00 00 00`），完整值才是玩家的遊戲內 UID。此修正已透過遊戲內截圖比對確認。
 
 #### Frame 3 — 心跳 / Tick 同步（72 bytes）
 
 格式：FlatBuffers，vtable 結構與 Frame 1 相同，field[0] 值遞增（message counter），entropy 極低（~3.2），確認為心跳包。
 
-#### Frame 4 — 遊戲世界狀態（~90–130 KB，視場景而定）
+#### Frame 4 — 連線狀態同步（~90–130 KB，視場景而定）
 
 格式：自定義二進位，分兩個固定大小子區域：
 
@@ -132,8 +151,8 @@ python frame_decoder.py --file frames.txt
 Frame 4
 ├── Dense Zone  [0 : 40960]    固定 40960 bytes
 │   ├── Header     [0 : 2560]   跨 session 完全靜態（連線 metadata，與玩家狀態無關）
-│   └── Entity 陣列 [2560:40960] 動態長度記錄陣列（怪物/隊友/掉落物/裝飾品）
-│       └── PrivateSpawnInfoRecord  以玩家 UID 標記的裝飾品擺放記錄
+│   └── Entity 陣列 [2560:40960] 動態長度記錄陣列，內容未完全解析
+│       └── PrivateSpawnInfoRecord  以玩家 UID 標記的記錄（推測為裝飾品擺放，但未獲 100% 確認）
 │
 └── Sparse Zone [40960 : end]  Quest/Item/社交字串記錄表（長度隨場景變化）
     ├── FlatBuffers header      root_offset=16，3 個欄位
@@ -144,7 +163,7 @@ Frame 4
         └── 32 字元 hex GUID（角色/物品實例 ID）
 ```
 
----
+**注意**：根據上方「重要修正」，這個 Frame 4 內的資料很可能也只是登入/初始化階段的快照，而非主世界即時同步資料，因此 Dense Zone 的 Entity 陣列嘗試比對 HP/能量數值一直失敗（見下方「失敗的嘗試」）。
 
 ### Quest Record 格式（Sparse Zone）
 
@@ -193,6 +212,17 @@ offset  size  型別      說明
 
 ---
 
+## 失敗的嘗試（誠實記錄）
+
+這個專案不是一路順利，記錄下走過的死路，避免日後重複嘗試：
+
+- **Dense Zone byte-diff 找 HP/能量欄位**：嘗試用 `dense_zone_differ.py` 比對「滿血」與「副本戰鬥中」兩份 PCAP，結果 Entity 陣列區段差異率高達 80.8%，無法從雜訊中分離出單一玩家的數值欄位。當時推測原因是陣列內怪物/隊友數量不同造成雜訊；現在回頭看，更可能的原因是**這條連線本身就不包含即時戰鬥數值**（見上方重要修正）。
+- **Header Zone diff**：`[0:2560]` 在所有樣本間完全沒有差異（0 bytes diff），證實這段是純連線 metadata，這個結論目前仍然成立。
+- **`2002144970` 誤判為玩家 UID**：曾一度懷疑這是玩家的遊戲 UID，後經使用者提供遊戲內截圖比對才發現這是錯的；真正的 UID 在 field[7]（見上方修正）。
+- **嘗試解密 TLS 認證流量**：曾有人提議用 `SSLKEYLOGFILE` + pyshark 解密 `mapi.pwsdk.com` 的登入請求以「確認帳號對應關係」，此方向被判定超出範圍並未執行——之後證實透過遊戲內截圖比對即可在不解密 TLS 的情況下達成同樣目的。
+
+---
+
 ## 腳本說明
 
 ### `nte_decoder_v3.py` — 主程式
@@ -219,8 +249,6 @@ offset  size  型別      說明
 | val_a | 當前進度值 |
 | val_b | 目標值（val_a == val_b = 完成）|
 
----
-
 ### `dense_zone_differ.py` — Dense Zone 差異分析
 
 ```
@@ -231,17 +259,7 @@ offset  size  型別      說明
   python dense_zone_differ.py --list                               列出所有快照
 ```
 
-**目前已知：**
-- Dense Zone 固定 40960 bytes
-- `[0:2560]` Header 區跨 session **完全靜態**，不含玩家狀態
-- `[2560:40960]` 為動態 entity 陣列，長度隨場景內物件數量變化，直接 diff 容易被雜訊淹沒
-
-**建議錄製方式（提高 diff 訊號比）：**
-1. 在**同一個場景/同一個 entity 陣列狀態**下錄兩次
-2. 兩次之間只改變一個變數（例如「被打一拳」掉血）
-3. 間隔時間越短越好，避免怪物/隊友進出造成陣列變動
-
----
+> **已知限制**：根據上方「重要修正」，這個工具設計用來找的 HP/能量欄位很可能根本不在這條連線裡。工具本身運作正常（已驗證能正確對齊、diff、解碼多型別），但目前沒有合適的資料可以拿來驗證其原本目的。
 
 ### `record_extractor.py` — 任務記錄提取器
 
@@ -251,8 +269,6 @@ offset  size  型別      說明
 用法：python record_extractor.py <pcap_file> [target_ip]
 輸出：categorized_records.csv / categorized_records.json
 ```
-
----
 
 ### `export_frames.py` + `frame_decoder.py`
 
@@ -275,19 +291,17 @@ Wireshark → Edit → Preferences → Capture → Default capture snaplen = 0
 1. 捕獲過濾器：`host 34.110.242.50`
 2. 進入地圖，等載入完成後再多等 10 秒才停止錄製
 
-**Dense Zone diff 專用：**
-- 同場景錄兩次，中間只改變一個數值狀態（HP/能量/CD）
-- 間隔越短越好
-
 ---
 
-## 已知限制 / 待研究
+## 已知限制 / 後續方向
 
-- **Dense Zone entity 陣列**：`[2560:40960]` 結構未解，含怪物/隊友/掉落物/裝飾品的混合記錄，需要受控環境下的短間隔 diff 才能定位 HP/能量/CD 等個人數值
-- **field[2] / field[6]**：Frame 2 中兩個不明 scalar（範圍 160-304），含義未知
-- **field[12] Zone ID**：對應關係已確認隨地圖變化，但完整地圖 ID 對照表未建立
-- **TLS 層**：`mapi.pwsdk.com` 等認證 API 全程加密，不在本專案分析範圍內
-- **隊伍社交資料區**：副本場景的 Sparse Zone 內含其他玩家的暱稱/GUID/帳號層級 ID，本專案不解析此區段
+- **本專案的分析範圍可能僅限於登入/連線初始化階段**，真正承載即時戰鬥數值的伺服器疑似透過 UE5 內建的 UDP replication 協定運作，本專案目前未涵蓋此部分（理由見上方「重要修正」）。
+- **Dense Zone entity 陣列**：`[2560:40960]` 結構未解，含怪物/隊友/掉落物/裝飾品的混合記錄。
+- **field[2] / field[6]**：Frame 2 中兩個不明 scalar（範圍 160-304），含義未知。
+- **field[12] Zone ID**：對應關係已確認隨地圖變化，但完整地圖 ID 對照表未建立。
+- **TLS 層**：`mapi.pwsdk.com` 等認證 API 全程加密，不在本專案分析範圍內，且本專案刻意不嘗試解密此流量。
+- **隊伍社交資料區**：副本場景的 Sparse Zone 內含其他玩家的暱稱/GUID/帳號層級 ID，本專案不解析此區段。
+- **UDP Replication 解碼**：技術上可行，但需要對遊戲客戶端進行逆向工程以取得 Class/Property 反射定義，已超出本專案範疇，目前**不會**往此方向繼續開發。
 
 ---
 

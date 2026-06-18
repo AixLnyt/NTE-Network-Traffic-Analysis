@@ -2,7 +2,9 @@
 
 English | [中文](./README.md)
 
-Reverse-engineering the private game communication protocol of **Neverness to Everness (NTE)**. Through PCAP traffic capture and Python static analysis, this project reconstructs the protocol's framing structure, serialization format, player state data, and quest system.
+Reverse-engineering part of the communication protocol used by **Neverness to Everness (NTE)**. Through PCAP traffic capture and Python static analysis, this project reconstructs the framing structure, serialization format, basic player info, and quest system of a single TCP connection.
+
+**This project has a limited scope**: everything documented here applies only to the `34.110.242.50:30031` **TCP** connection. Based on external information (see "Important Correction" below), this connection is most likely just a login/connection-init server, not the main game server carrying real-time combat values (HP, energy, etc.).
 
 ---
 
@@ -14,6 +16,24 @@ Reverse-engineering the private game communication protocol of **Neverness to Ev
 - This project is for protocol structure research and technical learning only. It **does not provide or assist in developing** any cheats, automation scripts, packet injection tools, or programs that compromise game fairness.
 - By using the contents of this project (including code and documentation), you agree to assume your own risk and responsibility, and to comply with the game's Terms of Service and applicable local laws. The author is not responsible for any account penalties or legal consequences resulting from the use of this project.
 - The code is provided "AS IS", without warranty of any kind, express or implied.
+
+---
+
+## ⚠️ Important Correction (please read this first)
+
+During analysis, someone in the community pointed out:
+
+> "`34.110.242.50:30031` is a login server using TCP. The real game server with all the interesting player data communicates via UE5's built-in replication protocol, built on top of UDP."
+
+This is technically plausible — Unreal Engine 5's networking/replication system is indeed built on UDP by default, designed for real-time, low-latency player state synchronization. This matches the characteristics of the TCP connection analyzed in this project (low packet frequency, heartbeat-like behavior, initialization-style data).
+
+**What this means:**
+
+1. Everything analyzed in this project (Frame 1-4, the Dense/Sparse Zones, the Quest Record format) is **most likely just part of the login flow**, not real-time main-world sync data.
+2. This would explain why we were never able to locate HP / energy / skill cooldown fields — that data simply isn't in this connection.
+3. We have not independently verified this claim ourselves (we have not captured and cross-checked UDP traffic). This is **a lead relayed from an external source**, but it currently appears credible.
+
+**This project will not pursue decoding UDP replication traffic going forward.** Rebuilding a decoder that correctly labels fields (character level, max HP, skill cooldowns, etc.) the way external community tools have done would require obtaining the game client's full Class/Property reflection definitions — which means reverse-engineering the game client binary itself. That is outside the scope of this project, which is limited to analyzing the structure of our own connection's traffic.
 
 ---
 
@@ -49,7 +69,7 @@ python nte_decoder_v3.py test01.pcap 34.110.242.50
 # View quest/item records only
 python record_extractor.py test01.pcap 34.110.242.50
 
-# Dense Zone diff comparison (find HP/Energy/CD fields)
+# Dense Zone diff comparison
 python dense_zone_differ.py --add full_hp.pcap --tag full_hp
 python dense_zone_differ.py --add low_hp.pcap  --tag low_hp
 python dense_zone_differ.py --diff full_hp low_hp --csv hp_diff.csv
@@ -61,14 +81,16 @@ python frame_decoder.py --file frames.txt
 
 ---
 
-## Protocol Reverse-Engineering Results
+## Verified Findings
+
+Everything below was cross-checked across multiple PCAP captures by us directly, and carries reasonably high confidence.
 
 ### Transport Layer
 
 | Item | Value |
 |---|---|
 | Transport protocol | TCP |
-| Target server | `34.110.242.50:30031` (GCP Asia node) |
+| Target server | `34.110.242.50:30031` (GCP Asia node, **suspected to be login/init server only — see correction above**) |
 | TLS | Yes (decrypted at the OS level; the payload itself has no additional application-layer encryption) |
 | Relay server | `34.146.x.x:302xx` (room/map instance, per-session) |
 
@@ -81,9 +103,7 @@ python frame_decoder.py --file frames.txt
 └────────────────────────────────────────────────────────┘
 ```
 
-The world-state frame (Frame 4) sent after connection setup **has no length prefix** — it begins immediately at the point where LE4 framing breaks down.
-
----
+The frame sent after connection setup (Frame 4) **has no length prefix** — it begins immediately at the point where LE4 framing breaks down.
 
 ### Frame Structure (fixed order per connection)
 
@@ -111,19 +131,19 @@ Format: FlatBuffers, containing one nested table (14 fields)
 | field[4] | `34.x.x.x:302xx` | Relay server (per-session) |
 | field[5] | coordinate string | `X,Y,Z\|Pitch,Yaw,Roll\|ScaleX,Y,Z` |
 | field[6] | `160–168` | unknown scalar |
-| **field[7]** | `123456789012  (12-digit example)` | **✅ Player in-game UID** (uint64 LE, verified via in-game screenshot) |
+| **field[7]** | `123456789012  (12-digit example)` | **Player in-game UID** (uint64 LE, verified via in-game screenshot) |
 | field[8] | blueprint path | Character blueprint path (includes character name) |
 | field[11] | `1` | active flag |
 | field[12] | `75777 / 77825` | Zone / Map Instance ID (changes with map) |
 | field[13] | `0xCDCDCDCD` | Uninitialized field (MSVC debug heap fill pattern, never set by server) |
 
-> **Important correction**: field[7] was previously misread as a uint32 nonce (`0xCE5A6BFA` = 3462032378). It should actually be read as **uint64 LE** (the next 4 bytes are `32 00 00 00`), giving the full value `123456789012  (12-digit example)`, which is the player's in-game UID.
+> **Field correction log**: field[7] was at one point misread as a uint32 nonce (`0xCE5A6BFA` = 3462032378). It should actually be read as **uint64 LE** (the next 4 bytes are `32 00 00 00`), giving the full value that is the player's in-game UID. This correction was confirmed against an in-game screenshot.
 
 #### Frame 3 — Heartbeat / Tick Sync (72 bytes)
 
 Format: FlatBuffers, same vtable structure as Frame 1. field[0] increments (message counter), entropy is very low (~3.2), confirming this is a heartbeat packet.
 
-#### Frame 4 — World State (~90–130 KB, depending on scene)
+#### Frame 4 — Connection State Sync (~90–130 KB, depending on scene)
 
 Format: custom binary, split into two fixed-size sub-regions:
 
@@ -131,8 +151,8 @@ Format: custom binary, split into two fixed-size sub-regions:
 Frame 4
 ├── Dense Zone  [0 : 40960]    fixed 40960 bytes
 │   ├── Header     [0 : 2560]   completely static across sessions (connection metadata, unrelated to player state)
-│   └── Entity Array [2560:40960] variable-length record array (monsters/teammates/drops/decorations)
-│       └── PrivateSpawnInfoRecord  decoration placement records, tagged with player UID
+│   └── Entity Array [2560:40960] variable-length record array, content not fully decoded
+│       └── PrivateSpawnInfoRecord  records tagged with player UID (presumed to be decoration placements, not 100% confirmed)
 │
 └── Sparse Zone [40960 : end]  Quest/Item/social string record table (length varies by scene)
     ├── FlatBuffers header      root_offset=16, 3 fields
@@ -143,7 +163,7 @@ Frame 4
         └── 32-char hex GUID (character/item instance ID)
 ```
 
----
+**Note**: per the correction above, the data in this Frame 4 is also most likely just a snapshot from the login/init phase, not real-time main-world sync data — which is why attempts to match HP/energy values in the Dense Zone's entity array consistently failed (see "Failed Attempts" below).
 
 ### Quest Record Format (Sparse Zone)
 
@@ -192,6 +212,17 @@ Values fixed across sessions: **UID `123456789012  (12-digit example)`**, **SDK 
 
 ---
 
+## Failed Attempts (an honest record)
+
+This project didn't go smoothly the whole way through. Recording the dead ends here to avoid repeating them:
+
+- **Dense Zone byte-diff to find HP/energy fields**: tried comparing a "full HP" capture against a "mid-dungeon combat" capture using `dense_zone_differ.py`. The entity array region showed an 80.8% diff rate, far too noisy to isolate a single player's value fields. At the time we assumed this was due to varying numbers of monsters/teammates in the array; in hindsight, the more likely explanation is that **this connection simply doesn't carry real-time combat data at all** (see the correction above).
+- **Header Zone diff**: `[0:2560]` showed zero byte differences across all samples, confirming this region is pure connection metadata. This conclusion still holds.
+- **Misidentifying `2002144970` as the player UID**: at one point we suspected this was the player's in-game UID. After the user provided an in-game screenshot for comparison, this turned out to be wrong — the real UID is in field[7] (see correction above).
+- **Attempting to decrypt TLS authentication traffic**: someone proposed using `SSLKEYLOGFILE` + pyshark to decrypt `mapi.pwsdk.com` login requests in order to "confirm the account mapping." This direction was judged out of scope and never executed — it was later confirmed that the same goal could be achieved via an in-game screenshot comparison, without touching TLS at all.
+
+---
+
 ## Script Reference
 
 ### `nte_decoder_v3.py` — Main Program
@@ -218,8 +249,6 @@ Output:
 | val_a | Current progress value |
 | val_b | Target value (val_a == val_b = completed) |
 
----
-
 ### `dense_zone_differ.py` — Dense Zone Diff Analysis
 
 ```
@@ -230,17 +259,7 @@ Usage:
   python dense_zone_differ.py --list                                  list all snapshots
 ```
 
-**Currently known:**
-- The Dense Zone is a fixed 40960 bytes
-- `[0:2560]` Header region is **completely static** across sessions and contains no player state
-- `[2560:40960]` is a variable-length entity array whose size depends on how many objects are in the scene; direct diffing tends to be drowned out by noise
-
-**Recommended capture method (to improve diff signal-to-noise):**
-1. Record two captures in **the same scene / same entity array state**
-2. Change only one variable between captures (e.g. "take one hit" to lose HP)
-3. Keep the interval between captures as short as possible to avoid monsters/teammates entering or leaving the array
-
----
+> **Known limitation**: per the correction above, the HP/energy fields this tool was designed to locate most likely don't exist in this connection at all. The tool itself works correctly (alignment, diffing, and multi-type decoding have all been verified), but there is currently no suitable data to validate it against its original intended purpose.
 
 ### `record_extractor.py` — Quest Record Extractor
 
@@ -250,8 +269,6 @@ Lightweight extraction tool with category labels.
 Usage: python record_extractor.py <pcap_file> [target_ip]
 Output: categorized_records.csv / categorized_records.json
 ```
-
----
 
 ### `export_frames.py` + `frame_decoder.py`
 
@@ -274,19 +291,17 @@ Wireshark → Edit → Preferences → Capture → Default capture snaplen = 0
 1. Capture filter: `host 34.110.242.50`
 2. Enter the map, wait for it to fully load, then wait an additional 10 seconds before stopping the capture
 
-**For Dense Zone diffing:**
-- Record twice in the same scene, changing only one numeric state (HP/Energy/CD) in between
-- Keep the interval as short as possible
-
 ---
 
-## Known Limitations / Future Work
+## Known Limitations / Future Direction
 
-- **Dense Zone entity array**: the structure of `[2560:40960]` is not yet decoded; it contains a mix of records for monsters/teammates/drops/decorations. Short-interval diffs in a controlled environment are needed to locate personal values like HP/Energy/CD
-- **field[2] / field[6]**: two unknown scalars in Frame 2 (range 160-304), meaning unknown
-- **field[12] Zone ID**: confirmed to correlate with map changes, but a complete map ID lookup table has not been built
-- **TLS layer**: authentication APIs such as `mapi.pwsdk.com` are fully encrypted and out of scope for this project
-- **Party social data region**: the Sparse Zone in dungeon scenes contains other players' nicknames/GUIDs/account-level IDs; this project does not parse this region
+- **This project's analysis is likely scoped only to the login/connection-init phase.** The server actually carrying real-time combat values is suspected to operate over UE5's built-in UDP replication protocol, which this project does not cover (see "Important Correction" above for the reasoning).
+- **Dense Zone entity array**: the structure of `[2560:40960]` is not yet decoded; it contains a mix of records for monsters/teammates/drops/decorations.
+- **field[2] / field[6]**: two unknown scalars in Frame 2 (range 160-304), meaning unknown.
+- **field[12] Zone ID**: confirmed to correlate with map changes, but a complete map ID lookup table has not been built.
+- **TLS layer**: authentication APIs such as `mapi.pwsdk.com` are fully encrypted and out of scope for this project; this project deliberately does not attempt to decrypt this traffic.
+- **Party social data region**: the Sparse Zone in dungeon scenes contains other players' nicknames/GUIDs/account-level IDs; this project does not parse this region.
+- **UDP Replication decoding**: technically feasible, but would require reverse-engineering the game client to obtain Class/Property reflection definitions. This is outside the scope of this project and **will not** be pursued further here.
 
 ---
 
